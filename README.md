@@ -14,10 +14,10 @@ A DIY head tracking system using ESP32 and BMI160 for gaming and simulations, co
 ## 🔧 Components
  
 ### Current Version (v1.0)
-- **ESP32-C3 SuperMini** (or any ESP32 with BLE) - ~$5
-- **BMI160** (accelerometer + gyroscope) - ~$4
+- **ESP32-C3 Super Mini** (or any ESP32 with BLE) - ~$3 → [AliExpress](https://fr.aliexpress.com/item/1005009449008124.html)
+- **BMI160** (accelerometer + gyroscope) - ~$2 → [AliExpress](https://fr.aliexpress.com/item/1005010706579096.html)
 - **4 jumper wires** female-female - ~$2
-- **Case/mount** (3D printing recommended) - ~$2
+- **Case/mount** (3D printing recommended) - <$1
 ### Future Version (v2.0) - In Development
 - **ESP32-S3 N4** - ~$3.8 (JLCPCB)
 - **ICM-20948** (9-axis, accelerometer + gyroscope + magnetometer) - ~$4.5
