@@ -1,24 +1,23 @@
 # EHT (Easy Head Tracking)
-
-A DIY head tracking system using ESP32 and MPU6050 for gaming and simulations, compatible with OpenTrack.
-
+ 
+A DIY head tracking system using ESP32 and BMI160 for gaming and simulations, compatible with OpenTrack.
+ 
 ## 🎯 Features
-
-- **3DOF Tracking**: Yaw, Pitch, Roll with gyroscope, accelerometer and magnetometer
-- **WiFi Transmission**: Real-time UDP data streaming
-- **Complementary Filter**: Eliminates drift on pitch/roll
-- **Start Up Yaw Calibartion**: Minimizes yaw drift
+ 
+- **3DOF Tracking**: Yaw, Pitch, Roll
+- **Bluetooth LE**: Wireless connection, no WiFi setup required
+- **Mahony Filter**: Quaternion-based fusion — no gimbal lock, minimal drift
+- **Gyro Calibration**: Automatic offset calibration at startup
+- **High Frequency Yaw**: Dedicated core for gyro integration
 - **Low Latency**: Less than 20ms end-to-end
 - **OpenTrack Compatible**: Plug & play with games and simulators
-
 ## 🔧 Components
-
+ 
 ### Current Version (v1.0)
-- **ESP32** (DevKit v1 or similar) - ~$8
-- **MPU6050** (accelerometer + gyroscope) - ~$3
+- **ESP32-C3** (or any ESP32 with BLE) - ~$5
+- **BMI160** (accelerometer + gyroscope) - ~$4
 - **4 jumper wires** female-female - ~$2
 - **Case/mount** (3D printing recommended) - ~$2
-
 ### Future Version (v2.0) - In Development
 - **ESP32-S3 N4** - ~$3.8 (JLCPCB)
 - **ICM-20948** (9-axis, accelerometer + gyroscope + magnetometer) - ~$4.5
@@ -27,24 +26,20 @@ A DIY head tracking system using ESP32 and MPU6050 for gaming and simulations, c
 - **Charging Circuit** (integrated PCB)
 - **ON/OFF Switch**
 - **Custom Case** (3D printed) - <$1
-
 ## 📐 Wiring Diagram
-
-### Version v1.0 (Prototype)
+ 
+### Version v1.0
 ```
-ESP32          MPU6050
------          -------
+ESP32-C3       BMI160
+--------       ------
 3.3V    ---    VCC
 GND     ---    GND
-GPIO21  ---    SDA
-GPIO22  ---    SCL
+GPIO8   ---    SDA
+GPIO9   ---    SCL
 ```
-
-### Version v2.0 (Custom PCB)
-*Detailed schematic available with custom PCB*
-
+ 
 ## 🚀 Installation
-
+ 
 ### 1. Prepare Environment
 ```bash
 # Install Arduino IDE
@@ -52,124 +47,113 @@ GPIO22  ---    SCL
 # File > Preferences > Additional Board Manager URLs
 # https://dl.espressif.com/dl/package_esp32_index.json
 ```
-
-### 2. Configure Code
-```cpp
-// Modify these variables in the code:
-const char* ssid     = "YOUR_WIFI";
-const char* password = "YOUR_PASSWORD";
-IPAddress pcIP(192, 168, 1, XXX);  // Your PC IP
-```
-
+ 
+### 2. Install Library
+- Open Arduino IDE → Tools → Manage Libraries
+- Search for `ESP32 BLE Gamepad` by **lemmingDev** and install it
 ### 3. Flash ESP32
-- Select board: `ESP32 Dev Module`
+- Select your ESP32 board
 - Select serial port
-- Make modifications to the code : Fill in your wifi ssid, password and your PC's IP adress (2. Configure Code)
 - Compile and upload
-
+- Keep the device **still** during the 2-second gyro calibration at startup
+### 4. Pair via Bluetooth
+- Open Windows Bluetooth settings
+- Pair `ESP32 Head Tracker` like any BLE device
 ## 🎮 OpenTrack Configuration
-
+ 
 ### 1. Install OpenTrack
 Download from: https://github.com/opentrack/opentrack/releases
-
+ 
 ### 2. Configuration
-1. **Input**: `UDP over network`
-   - Port: `4242`
-   - Bind address: `0.0.0.0`
-
+1. **Input**: `Joystick input`
+   - Select `ESP32 Head Tracker` from the device list
 2. **Output**: Choose according to your game
    - `freetrack 2.0 Enhanced` (most games)
    - `TrackIR` (for compatible games)
-
-3. **Mapping**: Adjust to your preferences
-
+3. **Axis mapping**:
+   - Joystick Axis 1 → Pitch
+   - Joystick Axis 2 → Roll
+   - Joystick Axis 3 → Yaw
 ### 3. Use
-- Switch on your EHT
-- Stay still while it calibrates (10 sec default)
-- Start OpenTrack
-- Click "Start"
-- You should see the octopus move with your head
-
-
+- Power on your EHT
+- Stay still for 2 seconds while the gyro calibrates
+- Open OpenTrack and click **Start**
+- The octopus should move with your head
+> ⚠️ **Star Citizen / DCS users**: Use OpenTrack's `freetrack` or `TrackIR` output — do **not** use the joystick axes directly in-game, as the device would be picked up as a controller and interfere with flight inputs.
+ 
 ## 📊 Performance
-
-- **Frequency**: 100Hz (10ms per sample)
+ 
+- **Frequency**: 100Hz output, high-frequency yaw integration on dedicated core
 - **Total Latency**: < 20ms
 - **Accuracy**: ±1° (pitch/roll), ±2° (yaw)
-- **Drift**: None on pitch/roll, slight on yaw
-
-## 🔧 Advanced Settings (v1.0)
-
+- **Drift**: None on pitch/roll (accelerometer correction), slow drift on yaw (no magnetometer)
+## 🔧 Advanced Settings
+ 
 ### Sensitivity Adjustment
 ```cpp
-// In code, final lines:
-headData[0] = yaw * 2.0;   // Multiply for more sensitivity
-headData[1] = pitch * 3.0;
-headData[2] = roll * 3.0;
+// In OpenTrack mapping curves — preferred over code changes
+// Or modify the map() ranges in the sketch:
+int16_t out_pitch = (int16_t)map(pitch, -45.0f, 45.0f, 0, 32767); // narrower = more sensitive
 ```
-
-### Complementary Filter
+ 
+### Mahony Filter Tuning
 ```cpp
-const float alpha = 0.99f;  // 0.95-0.99 recommended
-// Closer to 1.0 = more responsive but more noise
-// Closer to 0.9 = more stable but less responsive
+#define ALPHA_ACC 0.02f  // 0.01–0.05 recommended
+// Higher = accelerometer corrects faster (less drift, more noise on movement)
+// Lower  = gyro dominates (smoother, slower correction)
 ```
-
+ 
+### Yaw Drift
+```cpp
+#define YAW_DECAY 1.0f   // Set < 1.0 (e.g. 0.9995) to add auto-return-to-center
+```
+ 
 ## 🛠️ Troubleshooting
-
-### WiFi Connection Issues
-- Check SSID/password
-- Verify ESP32 is on same network
-- Restart router if necessary
-
+ 
+### Device not appearing in Bluetooth
+- Make sure ESP32 finished calibration (check Serial monitor)
+- Remove old pairing in Windows and re-pair
+### Joystick not showing in OpenTrack
+- Check Windows → Game Controllers (`joy.cpl`) — the device must appear there first
+- Reconnect via Bluetooth if needed
 ### Angle Drift
-- **Pitch/Roll**: No drift (complementary filter)
-- **Yaw**: Normal drift without magnetometer
-- Solution: Recalibrate with `Ctrl+Home` in OpenTrack
-
+- **Pitch/Roll**: Should be drift-free thanks to accelerometer correction
+- **Yaw**: Normal without magnetometer — recalibrate with `Ctrl+Home` in OpenTrack
+- Reduce `ALPHA_ACC` if pitch/roll shake during fast movements
 ### Erratic Data
-- Check I2C connections
-- Add decoupling capacitors if needed
+- Check I2C wiring (SDA/SCL)
 - Verify stable 3.3V power supply
-
-### High Latency
-- Reduce `LOOP_INTERVAL_MS` (watch CPU load)
-- Use 5GHz WiFi if possible
-- Disable WiFi sleep mode
-
+- Check Serial monitor for gyro offset values at startup — large offsets (>5°/s) indicate a wiring or power issue
 ## 🤝 Contributing
-
+ 
 Contributions are welcome! Feel free to:
 - Report bugs
 - Suggest improvements
 - Share hardware modifications
 - Add support for more games
-
 ## 📄 License
-
+ 
 See the `LICENSE` file for details.
-
+ 
 ## 🎮 Tested Games
-
+ 
 - ✅ **DCS World** (freetrack)
 - ✅ **Star Citizen** (freetrack)
-
 ## 🔮 Roadmap
-
+ 
 ### Version 1.0 (Current) ✅
 - [x] 3DOF tracking (Yaw, Pitch, Roll)
-- [x] WiFi UDP transmission
-- [x] Complementary filter
-- [x] Yaw Calibration
+- [x] Bluetooth LE transmission (no WiFi required)
+- [x] Mahony quaternion filter (no gimbal lock)
+- [x] Gyro calibration at startup
+- [x] High-frequency yaw on dedicated core
 - [x] OpenTrack compatibility
-
 ### Version 2.0 (Planned)
 - [ ] **EHT Custom PCB** - Compact and professional design
-- [ ] **Magnetometer support** - Eliminates yaw drift
+- [ ] **Magnetometer support** - Eliminates yaw drift completely
 - [ ] **Integrated battery** - 8-12h autonomy
 - [ ] **USB-C charging circuit** - Fast charging
-- [ ] **Status LEDs or Small OLED Screen** - Battery, WiFi, tracking
-
+- [ ] **Status LEDs or Small OLED Screen** - Battery, BLE, tracking status
 ---
-
+ 
 **⚠️ Important**: This project is for personal use. Please respect the terms of use of games and simulators.
