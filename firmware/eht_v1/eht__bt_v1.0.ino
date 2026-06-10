@@ -1,3 +1,5 @@
+//C++ script for EHT V1.0 hardware | BlueTooth version
+
 #include <Wire.h>
 #include <math.h>
 #include <BleGamepad.h>
