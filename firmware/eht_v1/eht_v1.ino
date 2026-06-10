@@ -1,311 +1,160 @@
 #include <Wire.h>
-#include <WiFi.h>
-#include <WiFiUdp.h>
+#include <math.h>
+#include <BleGamepad.h>
 
-// ======= Réseau =======
-const char* ssid     = "Livebox-197A";
-const char* password = "62AB114F8D346586595ED49934";
-IPAddress pcIP(192, 168, 1, 21);
-const uint16_t pcPort   = 4242;
-WiFiUDP udp;
-const uint16_t localPort = 4242;
+#define SDA_PIN  8
+#define SCL_PIN  9
+#define IMU_ADDR 0x69
 
-// ======= MPU6050 =======
-#define MPU_ADDR       0x68
-#define PWR_MGMT_1     0x6B
-#define ACCEL_XOUT_H   0x3B
-#define GYRO_XOUT_H    0x43
+TwoWire I2C_IMU = TwoWire(0);
+BleGamepad bleGamepad("EHT V1.0", "DIY", 100);
 
-// Variables de tracking (thread-safe avec mutex)
-portMUX_TYPE angleMux = portMUX_INITIALIZER_UNLOCKED;
-double headData[3];
-volatile float yaw = 0, pitch = 0, roll = 0;
+// ── Accelerometer correction gain (0=gyro only, 1=acc only) ─
+#define ALPHA_ACC 0.02f
 
-// Paramètres du filtre complémentaire
-const float alpha = 0.98f;
+volatile float q0=1, q1=0, q2=0, q3=0;
+portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Variables pour calibration automatique du drift
-float drift_sum = 0.0f;
-int drift_samples = 0;
-float drift_correction = 0.0f;
-bool calibration_complete = false;
-unsigned long calibration_start = 0;
-const unsigned long CALIBRATION_DURATION = 10000; // 10 secondes
+float gx_off=0, gy_off=0, gz_off=0;
 
-// Gestion d'erreurs I2C
-int i2c_error_count = 0;
-const int MAX_I2C_ERRORS = 3;
-bool mpu_initialized = false;
+void imuWrite(byte reg, byte val) {
+  I2C_IMU.beginTransmission(IMU_ADDR);
+  I2C_IMU.write(reg); I2C_IMU.write(val);
+  I2C_IMU.endTransmission(); delay(10);
+}
 
-// Queue pour communication inter-core
-QueueHandle_t sensorQueue;
-struct SensorData {
-  float ax_g, ay_g, az_g;
-  float gx_dps, gy_dps, gz_dps;
-  unsigned long timestamp;
-};
-
-// I2C write avec gestion d'erreur
-bool writeByte(uint8_t addr, uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.write(val);
-  uint8_t error = Wire.endTransmission();
-  
-  if (error != 0) {
-    i2c_error_count++;
-    return false;
+int16_t imuRead16(byte reg) {
+  I2C_IMU.beginTransmission(IMU_ADDR);
+  I2C_IMU.write(reg); I2C_IMU.endTransmission(false);
+  I2C_IMU.requestFrom(IMU_ADDR, (uint8_t)2);
+  if (I2C_IMU.available() >= 2) {
+    byte lo = I2C_IMU.read();
+    byte hi = I2C_IMU.read();
+    return (int16_t)(hi << 8 | lo);
   }
-  return true;
+  return 0;
 }
 
-// I2C read avec timeout
-bool readBytes(uint8_t addr, uint8_t reg, uint8_t len, uint8_t* buf) {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) {
-    i2c_error_count++;
-    return false;
+void calibrateGyro() {
+  Serial.println("Gyro calibration (keep still for 2s)...");
+  float sx=0, sy=0, sz=0;
+  for (int i=0; i<200; i++) {
+    sx += imuRead16(0x0C) / 16.4f;
+    sy += imuRead16(0x0E) / 16.4f;
+    sz += imuRead16(0x10) / 16.4f;
+    delay(10);
   }
-  
-  if (Wire.requestFrom(addr, len) != len) {
-    i2c_error_count++;
-    return false;
-  }
-  
-  for (uint8_t i = 0; i < len; i++) {
-    buf[i] = Wire.read();
-  }
-  return true;
+  gx_off=sx/200.0f; gy_off=sy/200.0f; gz_off=sz/200.0f;
+  Serial.printf("Gyro offsets → X:%.3f Y:%.3f Z:%.3f\n", gx_off, gy_off, gz_off);
 }
 
-// Initialisation MPU6050
-bool initMPU() {
-  if (!writeByte(MPU_ADDR, PWR_MGMT_1, 0x80)) return false; 
-  delay(50);
-  if (!writeByte(MPU_ADDR, PWR_MGMT_1, 0x00)) return false; 
-  delay(10);
-  
-  // Configuration optimisée pour la précision
-  if (!writeByte(MPU_ADDR, 0x1A, 0x01)) return false; // DLPF = 188Hz
-  if (!writeByte(MPU_ADDR, 0x1B, 0x00)) return false; // Gyro ±250°/s
-  if (!writeByte(MPU_ADDR, 0x1C, 0x00)) return false; // Accel ±2g
-  if (!writeByte(MPU_ADDR, 0x19, 0x07)) return false; // Sample rate = 125Hz
-  
-  return true;
-}
+// ── High frequency task on Core 0 ───────────────────────────
+// Integrates gx+gy+gz + accelerometer correction into quaternion
+void imuTask(void* pvParameters) {
+  unsigned long lastUs = micros();
+  for (;;) {
+    unsigned long now = micros();
+    float dt = (now - lastUs) / 1e6f;
+    lastUs = now;
 
-// Réinitialisation I2C
-void resetI2C() {
-  Wire.end();
-  delay(30);
-  Wire.begin(10, 11);
-  Wire.setClock(400000);
-  delay(30);
-  
-  mpu_initialized = initMPU();
-  i2c_error_count = 0;
-}
+    if (dt <= 0 || dt > 0.005f) continue;
 
-// Runge-Kutta 2ème ordre pour l'intégration du yaw
-float rungeKutta2_yaw(float current_yaw, float gz_dps, float dt) {
-  // K1 = f(t, y) = gz_dps
-  float k1 = gz_dps;
-  
-  // K2 = f(t + dt/2, y + k1*dt/2) 
-  // Pour une vitesse angulaire constante sur dt, k2 = k1
-  float k2 = gz_dps;
-  
-  // Intégration RK2
-  return current_yaw + dt * (k1 + k2) / 2.0f;
-}
+    // Gyro reading (rad/s)
+    float gx = (imuRead16(0x0C)/16.4f - gx_off) * DEG_TO_RAD;
+    float gy = (imuRead16(0x0E)/16.4f - gy_off) * DEG_TO_RAD;
+    float gz = (imuRead16(0x10)/16.4f - gz_off) * DEG_TO_RAD;
 
-// Filtre complémentaire avec Runge-Kutta pour le yaw
-void updateAngles(float gx_dps, float gy_dps, float gz_dps, float ax_g, float ay_g, float az_g, float dt) {
-  // Phase de calibration du drift (10 secondes)
-  if (!calibration_complete) {
-    drift_sum += gz_dps;
-    drift_samples++;
-    
-    // Vérifier si la calibration est terminée
-    if (millis() - calibration_start >= CALIBRATION_DURATION) {
-      drift_correction = drift_sum / drift_samples;
-      calibration_complete = true;
-      Serial.printf("Calibration terminée - Drift correction: %.4f deg/s\n", drift_correction);
-    }
-    return; // Ne pas calculer les angles pendant la calibration
-  }
-  
-  // Calcul des angles depuis l'accéléromètre
-  float pitch_acc = atan2(-ax_g, sqrt(ay_g*ay_g + az_g*az_g)) * 180.0f / PI;
-  float roll_acc = atan2(ay_g, az_g) * 180.0f / PI;
-  
-  // Filtre complémentaire pour pitch et roll
-  pitch = alpha * (pitch + gy_dps * dt) + (1.0f - alpha) * pitch_acc;
-  roll = alpha * (roll + gx_dps * dt) + (1.0f - alpha) * roll_acc;
-  
-  gz_dps = gz_dps - drift_correction;
-  // Intégration Runge-Kutta 2ème ordre pour le yaw
-  yaw = rungeKutta2_yaw(yaw, gz_dps, dt);
-  
-  // Normalisation du yaw
-  if (yaw > 180.0f) yaw -= 360.0f;
-  if (yaw < -180.0f) yaw += 360.0f;
-}
+    // Accelerometer reading
+    float ax = imuRead16(0x12) / 16384.0f;
+    float ay = imuRead16(0x14) / 16384.0f;
+    float az = imuRead16(0x16) / 16384.0f;
 
-// CORE 0: Acquisition des données senseur (haute priorité)
-void sensorTask(void *pvParameters) {
-  for(;;) {
-    // Reset I2C si trop d'erreurs
-    if (i2c_error_count > MAX_I2C_ERRORS) {
-      resetI2C();
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
+    portENTER_CRITICAL(&qMux);
+    float lq0=q0, lq1=q1, lq2=q2, lq3=q3;
+    portEXIT_CRITICAL(&qMux);
+
+    // ── Accelerometer correction (Mahony) ─────────────────
+    // Estimated gravity vector from current quaternion
+    float an = sqrtf(ax*ax + ay*ay + az*az);
+    if (an > 0.5f && an < 1.5f) {
+      ax/=an; ay/=an; az/=an;
+
+      // Expected gravity in sensor frame
+      float vx = 2*(lq1*lq3 - lq0*lq2);
+      float vy = 2*(lq0*lq1 + lq2*lq3);
+      float vz = lq0*lq0 - lq1*lq1 - lq2*lq2 + lq3*lq3;
+
+      // Error = cross product between measured and estimated gravity
+      float ex = ay*vz - az*vy;
+      float ey = az*vx - ax*vz;
+      float ez = ax*vy - ay*vx;
+
+      // Proportional correction applied to gyro rates
+      gx += ALPHA_ACC * ex;
+      gy += ALPHA_ACC * ey;
+      gz += ALPHA_ACC * ez;
     }
 
-    if (!mpu_initialized) {
-      vTaskDelay(pdMS_TO_TICKS(100));
-      continue;
-    }
+    // ── Quaternion integration (full gx gy gz) ────────────
+    float h = 0.5f * dt;
+    float nq0 = lq0 + h*(-lq1*gx - lq2*gy - lq3*gz);
+    float nq1 = lq1 + h*( lq0*gx + lq2*gz - lq3*gy);
+    float nq2 = lq2 + h*( lq0*gy - lq1*gz + lq3*gx);
+    float nq3 = lq3 + h*( lq0*gz + lq1*gy - lq2*gx);
 
-    // Lecture des données MPU6050
-    uint8_t accel_buf[6], gyro_buf[6];
-    bool accel_ok = readBytes(MPU_ADDR, ACCEL_XOUT_H, 6, accel_buf);
-    bool gyro_ok = readBytes(MPU_ADDR, GYRO_XOUT_H, 6, gyro_buf);
+    // Normalize
+    float n = sqrtf(nq0*nq0 + nq1*nq1 + nq2*nq2 + nq3*nq3);
+    nq0/=n; nq1/=n; nq2/=n; nq3/=n;
 
-    if (!accel_ok || !gyro_ok) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-      continue;
-    }
-
-    // Conversion des données
-    int16_t raw_ax = (accel_buf[0] << 8) | accel_buf[1];
-    int16_t raw_ay = (accel_buf[2] << 8) | accel_buf[3];
-    int16_t raw_az = (accel_buf[4] << 8) | accel_buf[5];
-    
-    int16_t raw_gx = (gyro_buf[0] << 8) | gyro_buf[1];
-    int16_t raw_gy = (gyro_buf[2] << 8) | gyro_buf[3];
-    int16_t raw_gz = (gyro_buf[4] << 8) | gyro_buf[5];
-
-    // Préparation des données pour le calcul
-    SensorData data;
-    data.ax_g = raw_ax / 16384.0f;
-    data.ay_g = raw_ay / 16384.0f;
-    data.az_g = raw_az / 16384.0f;
-    data.gx_dps = raw_gx / 131.0f;
-    data.gy_dps = raw_gy / 131.0f;
-    data.gz_dps = raw_gz / 131.0f;
-    data.timestamp = millis();
-
-    // Envoi vers le core de calcul (non-bloquant)
-    xQueueSend(sensorQueue, &data, 0);
-
-    // Fréquence ~500Hz pour l'acquisition
-    vTaskDelay(pdMS_TO_TICKS(2));
+    portENTER_CRITICAL(&qMux);
+    q0=nq0; q1=nq1; q2=nq2; q3=nq3;
+    portEXIT_CRITICAL(&qMux);
   }
 }
 
-// CORE 1: Calcul et transmission (loop principal)
 void setup() {
   Serial.begin(115200);
-  
-  // I2C setup
-  Wire.begin(10, 11);
-  Wire.setClock(400000);
-  
-  // Initialisation MPU6050
-  mpu_initialized = initMPU();
-  if (!mpu_initialized) {
-    Serial.println("MPU6050 init failed!");
-  } else {
-    Serial.println("MPU6050 OK - RK2 Simple");
-  }
+  I2C_IMU.begin(SDA_PIN, SCL_PIN, 400000);
 
-  // Wi-Fi
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+  imuWrite(0x7E, 0xB6); delay(100); // Soft reset
+  imuWrite(0x7E, 0x11); delay(100); // Accelerometer normal mode
+  imuWrite(0x7E, 0x15); delay(100); // Gyro normal mode
+  Serial.println("BMI160 OK");
 
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 10000) {
-    delay(500);
-    Serial.print(".");
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi OK");
-    udp.begin(localPort);
-  } else {
-    Serial.println("\nWiFi FAILED");
-  }
+  calibrateGyro();
 
-  // Création de la queue inter-core
-  sensorQueue = xQueueCreate(10, sizeof(SensorData));
-  
-  // Lancement de la tâche d'acquisition sur le Core 0
-  xTaskCreatePinnedToCore(
-    sensorTask,     // Fonction
-    "SensorTask",   // Nom
-    4096,          // Stack size
-    NULL,          // Paramètres
-    2,             // Priorité (haute)
-    NULL,          // Handle
-    0              // Core 0
-  );
+  // Launch IMU task on Core 0 (loop() runs on Core 1)
+  xTaskCreatePinnedToCore(imuTask, "IMUTask", 4096, NULL, 2, NULL, 0);
 
-  Serial.println("Dual-core setup OK");
-  
-  // Démarrage de la calibration du drift
-  calibration_start = millis();
-  Serial.println("Calibration du drift en cours (10s)... Ne pas bouger le capteur!");
+  bleGamepad.begin();
+  Serial.println("BLE started...");
 }
 
 void loop() {
-  static unsigned long lastTime = millis();
-  SensorData data;
-  
-  // Réception des données du core d'acquisition
-  if (xQueueReceive(sensorQueue, &data, pdMS_TO_TICKS(5)) == pdPASS) {
-    
-    // Calcul du temps écoulé
-    float dt = (data.timestamp - lastTime) / 1000.0f;
-    dt = constrain(dt, 0.001f, 0.1f); // Limitation pour éviter les valeurs aberrantes
-    lastTime = data.timestamp;
+  if (!bleGamepad.isConnected()) { delay(10); return; }
 
-    // Mise à jour des angles avec protection thread-safe
-    portENTER_CRITICAL(&angleMux);
-    updateAngles(data.gx_dps, data.gy_dps, data.gz_dps, 
-                 data.ax_g, data.ay_g, data.az_g, dt);
-    
-    // Copie des angles pour transmission
-    headData[0] = yaw * 2.0;
-    headData[1] = pitch * 3.0;
-    headData[2] = roll * 3.0;
-    portEXIT_CRITICAL(&angleMux);
+  // ── Thread-safe quaternion read ───────────────────────
+  portENTER_CRITICAL(&qMux);
+  float lq0=q0, lq1=q1, lq2=q2, lq3=q3;
+  portEXIT_CRITICAL(&qMux);
 
-    // Debug périodique
-    static unsigned long lastDebug = 0;
-    if (millis() - lastDebug > 1000) {
-      if (calibration_complete) {
-        Serial.printf("Yaw: %.2f Pitch: %.2f Roll: %.2f | dt: %.3f | Drift: %.4f\n", 
-                      yaw, pitch, roll, dt, drift_correction);
-      } else {
-        unsigned long remaining = CALIBRATION_DURATION - (millis() - calibration_start);
-        Serial.printf("Calibration... %lu ms restantes\n", remaining);
-      }
-      lastDebug = millis();
-    }
-  }
+  // ── Euler angles from quaternion ──────────────────────
+  float pitch = asinf(constrain(2*(lq0*lq2 - lq3*lq1), -1.0f, 1.0f)) * RAD_TO_DEG;
+  float roll  = atan2f(2*(lq0*lq1 + lq2*lq3),
+                       1 - 2*(lq1*lq1 + lq2*lq2)) * RAD_TO_DEG;
+  float yaw   = atan2f(2*(lq0*lq3 + lq1*lq2),
+                       1 - 2*(lq2*lq2 + lq3*lq3)) * RAD_TO_DEG;
 
-  // Envoi UDP seulement après calibration
-  static unsigned long lastUdp = 0;
-  if (calibration_complete && millis() - lastUdp > 10) {
-    if (udp.beginPacket(pcIP, pcPort)) {
-      udp.write((uint8_t*)headData, sizeof(headData));
-      udp.endPacket();
-    }
-    lastUdp = millis();
-  }
+  // ── Map angles to BLE Gamepad range (0..32767) ────────
+  int16_t out_pitch = (int16_t)map(pitch, -90.0f,  90.0f,  0, 32767);
+  int16_t out_roll  = (int16_t)map(roll, -180.0f, 180.0f,  0, 32767);
+  int16_t out_yaw   = (int16_t)map(yaw,  -180.0f, 180.0f,  0, 32767);
 
-  // Petite pause pour ne pas surcharger
-  delay(1);
+  bleGamepad.setX(out_pitch);
+  bleGamepad.setY(out_roll);
+  bleGamepad.setZ(out_yaw);
+  bleGamepad.sendReport();
+
+  Serial.printf("P:%6.1f° R:%6.1f° Y:%6.1f°\n", pitch, roll, yaw);
+  delay(10);
 }
